@@ -72,6 +72,11 @@ func main() {
 	maxPerMB = tlb.MustFromTON(*maxPerMBStr)
 	minRewardToVerify = tlb.MustFromTON(*minRewardToVerifyStr)
 
+	if *walletKeyBase == "" {
+		log.Error().Msg("wallet key is required")
+		return
+	}
+
 	var walletKey, err = base64.StdEncoding.DecodeString(*walletKeyBase)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to decode wallet key")
