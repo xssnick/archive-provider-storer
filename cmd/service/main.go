@@ -37,6 +37,7 @@ import (
 
 type Provider struct {
 	ID            []byte
+	BagsNum       int
 	WaitingForBag bool
 }
 
@@ -60,6 +61,8 @@ var storagePassword = flag.String("storage-password", "1", "Tonutils Storage ser
 var indexUrl = flag.String("index-url", "https://archival-dump.ton.org/index/mainnet.json", "Bags index URL")
 var limitBags = flag.Int("limit-bags", 10, "Limit for bags to process (0 = all)")
 var limitProviders = flag.Int("limit-providers", 100, "Limit for providers filter request (all fetched within single request)")
+var replicas = flag.Int("replicas", 3, "Providers per bag")
+var maxBagsPerProvider = flag.Int("max-bags-per-provider", 10, "Max bags per provider")
 
 var minBalance, maxBalance, gasFeeAdd, maxPerMB, minRewardToVerify tlb.Coins
 
@@ -264,7 +267,49 @@ next:
 		})
 	}
 
-	log.Info().Msg("checking bags")
+	log.Info().Msg("checking bags num stored")
+
+	for _, dt := range details {
+		id, err := hex.DecodeString(dt.BagID)
+		if err != nil {
+			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to decode bag id")
+			return 0, err
+		}
+
+		mHash, err := hex.DecodeString(dt.MerkleHash)
+		if err != nil {
+			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to decode merkle hash")
+			return 0, err
+		}
+
+		addr, _, _, err := contract.PrepareV1DeployData(id, mHash, dt.BagSize, dt.PieceSize, wl.WalletAddress(), nil)
+		if err != nil {
+			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to calc contract address")
+			return 0, err
+		}
+
+		master, err := api.WaitForBlock(fromBlock).CurrentMasterchainInfo(context.Background())
+		if err != nil {
+			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to get masterchain info")
+			return 0, err
+		}
+
+		curProviders, _, err := contract.GetProvidersV1(context.Background(), api, master, addr)
+		if err != nil && !errors.Is(err, contract.ErrNotDeployed) {
+			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to calc contract address")
+			return 0, err
+		}
+
+		for _, cp := range curProviders {
+			for _, p := range providers {
+				if bytes.Equal(cp.Key, p.ID) {
+					p.BagsNum++
+				}
+			}
+		}
+	}
+
+	log.Info().Msg("checking bags providers")
 
 	var messages []*wallet.Message
 	for _, dt := range details {
@@ -352,7 +397,7 @@ next:
 			validProviders = append(validProviders, prv)
 		}
 
-		if len(validProviders) < 3 {
+		if len(validProviders) < *replicas {
 			var newProviders []contract.ProviderV1
 			for _, prv := range validProviders {
 				// add prev valid providers
@@ -366,11 +411,16 @@ next:
 			var providerUpdated bool
 		nextProvider:
 			for _, prv := range providers {
-				if len(newProviders) == 3 {
+				if len(newProviders) == *replicas {
 					break
 				}
 				if prv.WaitingForBag {
 					log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("provider is waiting for another bag confirmation")
+					continue
+				}
+
+				if prv.BagsNum >= *maxBagsPerProvider {
+					log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("provider has too many bags, skip")
 					continue
 				}
 
@@ -418,6 +468,7 @@ next:
 
 				log.Info().Str("bag", dt.BagID).Hex("provider", prv.ID).Str("per_mb_day", perMB.String()).Msg("adding new provider")
 
+				prv.BagsNum++
 				newProviders = append(newProviders, contract.ProviderV1{
 					Address:       address.NewAddress(0, 0, prv.ID),
 					MaxSpan:       offer.Span,
