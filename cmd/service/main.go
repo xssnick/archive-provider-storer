@@ -318,6 +318,8 @@ next:
 			break
 		}
 
+		log.Info().Str("id", dt.BagID).Msg("checking bag")
+
 		id, err := hex.DecodeString(dt.BagID)
 		if err != nil {
 			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to decode bag id")
@@ -442,6 +444,15 @@ next:
 					continue
 				}
 
+				if rates.MaxSpan > uint32(*maxSpanAllowed) {
+					rates.MaxSpan = uint32(*maxSpanAllowed)
+				}
+
+				if rates.MaxSpan < rates.MinSpan {
+					log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("max span too low, skip")
+					continue
+				}
+
 				perMB := tlb.FromNanoTON(new(big.Int).SetBytes(rates.RatePerMBDay))
 				offer := provider.CalculateBestProviderOffer(&provider.ProviderRates{
 					Available:        rates.Available,
@@ -452,11 +463,6 @@ next:
 					MaxSpan:          rates.MaxSpan,
 					Size:             dt.BagSize,
 				})
-
-				if offer.Span > uint32(*maxSpanAllowed) {
-					log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("span too high, skip")
-					continue
-				}
 
 				if offer.PerProofNano.Cmp(minRewardToVerify.Nano()) > 0 {
 					// not typical price, check per mb
