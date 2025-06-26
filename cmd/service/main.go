@@ -88,7 +88,9 @@ func main() {
 
 	log.Logger = zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger().Level(zerolog.DebugLevel)
 
-	lsCfg, err := liteclient.GetConfigFromUrl(context.Background(), *networkConfigUrl)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	lsCfg, err := liteclient.GetConfigFromUrl(ctx, *networkConfigUrl)
+	cancel()
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to get lite client config")
 		return
@@ -269,6 +271,11 @@ next:
 
 	log.Info().Msg("checking bags num stored")
 
+	ac := api
+	if fromBlock > 0 {
+		ac = api.WaitForBlock(fromBlock)
+	}
+
 	for _, dt := range details {
 		id, err := hex.DecodeString(dt.BagID)
 		if err != nil {
@@ -288,13 +295,17 @@ next:
 			return 0, err
 		}
 
-		master, err := api.WaitForBlock(fromBlock).CurrentMasterchainInfo(context.Background())
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		master, err := ac.CurrentMasterchainInfo(ctx)
+		cancel()
 		if err != nil {
 			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to get masterchain info")
 			return 0, err
 		}
 
-		curProviders, _, err := contract.GetProvidersV1(context.Background(), api, master, addr)
+		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+		curProviders, _, err := contract.GetProvidersV1(ctx, api, master, addr)
+		cancel()
 		if err != nil && !errors.Is(err, contract.ErrNotDeployed) {
 			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to calc contract address")
 			return 0, err
@@ -338,13 +349,19 @@ next:
 			continue
 		}
 
-		master, err := api.WaitForBlock(fromBlock).CurrentMasterchainInfo(context.Background())
+		log.Info().Str("id", dt.BagID).Msg("getting contract")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		master, err := ac.CurrentMasterchainInfo(ctx)
+		cancel()
 		if err != nil {
 			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to get masterchain info")
 			continue
 		}
 
-		curProviders, balance, err := contract.GetProvidersV1(context.Background(), api, master, addr)
+		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+		curProviders, balance, err := contract.GetProvidersV1(ctx, api, master, addr)
+		cancel()
 		if err != nil && !errors.Is(err, contract.ErrNotDeployed) {
 			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to calc contract address")
 			continue
@@ -362,8 +379,10 @@ next:
 
 			toProof := uint64(rand.Int()) % dt.BagSize
 
+			log.Debug().Str("bag", dt.BagID).Hex("provider", prv.Key).Msg("requesting provider info")
+
 			var suspect bool
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
 			stResp, err := providerClient.RequestStorageInfo(ctx, prv.Key, addr, toProof)
 			cancel()
 			if err != nil {
@@ -433,7 +452,11 @@ next:
 					}
 				}
 
-				rates, err := providerClient.GetStorageRates(context.Background(), prv.ID, dt.BagSize)
+				log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("requesting provider storage rates")
+
+				ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+				rates, err := providerClient.GetStorageRates(ctx, prv.ID, dt.BagSize)
+				cancel()
 				if err != nil {
 					log.Error().Err(err).Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("failed to get rates")
 					continue
