@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -31,6 +32,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"sort"
 	"sync/atomic"
 	"time"
 )
@@ -39,6 +41,22 @@ type Provider struct {
 	ID            []byte
 	BagsNum       int
 	WaitingForBag bool
+}
+
+type StatBag struct {
+	ID           string
+	Contract     string
+	ProvidersNum int
+	Balance      string
+	TotalPerDay  *big.Int
+}
+
+type StatProvider struct {
+	ID               string
+	BagsNum          int
+	WaitingForBag    bool
+	ProofLongTimeAgo bool
+	TotalPerDay      *big.Int
 }
 
 type MTPResponse struct {
@@ -63,6 +81,8 @@ var limitBags = flag.Int("limit-bags", 10, "Limit for bags to process (0 = all)"
 var limitProviders = flag.Int("limit-providers", 100, "Limit for providers filter request (all fetched within single request)")
 var replicas = flag.Int("replicas", 3, "Providers per bag")
 var maxBagsPerProvider = flag.Int("max-bags-per-provider", 10, "Max bags per provider")
+var enableStats = flag.Bool("enable-stats", false, "Enable stats write to csv")
+var noTx = flag.Bool("no-tx", false, "Disable transactions")
 
 var minBalance, maxBalance, gasFeeAdd, maxPerMB, minRewardToVerify tlb.Coins
 
@@ -167,6 +187,9 @@ func main() {
 var addedProviders = make(map[string]time.Time)
 
 func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *transport.Client, api ton.APIClientWrapped, idxUrl, providersUrl string, fromBlock uint32) (uint32, error) {
+	bagStats := make(map[string]*StatBag)
+	providerStats := make(map[string]*StatProvider)
+
 	hCli := http.Client{Timeout: 10 * time.Second}
 	resp, err := hCli.Get(idxUrl)
 	if err != nil {
@@ -304,14 +327,52 @@ next:
 		}
 
 		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
-		curProviders, _, err := contract.GetProvidersV1(ctx, api, master, addr)
+		curProviders, balance, err := contract.GetProvidersV1(ctx, api, master, addr)
 		cancel()
 		if err != nil && !errors.Is(err, contract.ErrNotDeployed) {
-			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to calc contract address")
+			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to get providers")
 			return 0, err
 		}
 
 		for _, cp := range curProviders {
+			if *enableStats {
+				m := new(big.Int).Mul(new(big.Int).SetUint64(dt.BagSize), cp.RatePerMB.Nano())
+				// perProof := new(big.Int).Div(m.Mul(m, big.NewInt(int64(cp.MaxSpan))), big.NewInt(86400*1024*1024))
+				perDay := new(big.Int).Div(m, big.NewInt(1024*1024))
+
+				ps := providerStats[hex.EncodeToString(cp.Key)]
+				if ps == nil {
+					ps = &StatProvider{
+						ID:          dt.BagID,
+						TotalPerDay: big.NewInt(0),
+					}
+					providerStats[hex.EncodeToString(cp.Key)] = ps
+				}
+				ps.BagsNum++
+				ps.TotalPerDay.Add(ps.TotalPerDay, perDay)
+
+				if !ps.WaitingForBag {
+					ps.WaitingForBag = cp.LastProofAt.IsZero()
+				}
+
+				if !ps.ProofLongTimeAgo && !cp.LastProofAt.IsZero() {
+					ps.ProofLongTimeAgo = cp.LastProofAt.Before(time.Now().Add(-time.Duration(cp.MaxSpan) * time.Second))
+				}
+
+				sb := bagStats[dt.BagID]
+				if sb == nil {
+					sb = &StatBag{
+						ID:           dt.BagID,
+						Contract:     addr.String(),
+						ProvidersNum: len(curProviders),
+						Balance:      balance.String(),
+						TotalPerDay:  big.NewInt(0),
+					}
+					bagStats[dt.BagID] = sb
+				}
+				sb.TotalPerDay.Add(sb.TotalPerDay, perDay)
+			}
+
 			for _, p := range providers {
 				if bytes.Equal(cp.Key, p.ID) {
 					p.BagsNum++
@@ -349,7 +410,7 @@ next:
 			continue
 		}
 
-		log.Info().Str("id", dt.BagID).Msg("getting contract")
+		log.Info().Str("id", dt.BagID).Str("addr", addr.String()).Msg("getting contract")
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		master, err := ac.CurrentMasterchainInfo(ctx)
@@ -378,8 +439,8 @@ next:
 			}
 
 			toProof := uint64(rand.Int()) % dt.BagSize
-
-			log.Debug().Str("bag", dt.BagID).Hex("provider", prv.Key).Msg("requesting provider info")
+			log.Debug().Str("bag", dt.BagID).Hex("provider", prv.Key).
+				Str("per_mb", prv.RatePerMB.String()).Uint32("span", prv.MaxSpan).Uint64("sz_gb", dt.BagSize>>30).Msg("requesting provider info")
 
 			var suspect bool
 			ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
@@ -556,7 +617,7 @@ next:
 		}
 	}
 
-	if len(messages) > 0 {
+	if len(messages) > 0 && !*noTx {
 		tx, block, err := wl.SendManyWaitTransaction(context.Background(), messages)
 		if err != nil {
 			return 0, fmt.Errorf("failed to send messages: %w", err)
@@ -566,7 +627,89 @@ next:
 		log.Info().Str("hash", base64.StdEncoding.EncodeToString(tx.Hash)).Int("messages", len(messages)).Msg("executed transaction")
 	}
 
+	if *enableStats {
+		var pStats []*StatProvider
+		var bStats []*StatBag
+		for _, v := range providerStats {
+			pStats = append(pStats, v)
+		}
+		for _, v := range bagStats {
+			bStats = append(bStats, v)
+		}
+
+		sort.Slice(pStats, func(i, j int) bool {
+			return pStats[i].ID < pStats[j].ID
+		})
+		sort.Slice(bStats, func(i, j int) bool {
+			return bStats[i].ID < bStats[j].ID
+		})
+		log.Info().Int("providers", len(pStats)).Int("bags", len(bStats)).Msg("saving stats")
+
+		err = exportStatsToCSV(pStats, bStats, "provider_stats.csv", "bag_stats.csv")
+		if err != nil {
+			log.Error().Err(err).Msg("failed to export stats to CSV")
+		}
+	}
+
 	return fromBlock, nil
+}
+
+func exportStatsToCSV(providerStats []*StatProvider, bagStats []*StatBag, providerFilePath, bagFilePath string) error {
+	providerFile, err := os.Create(providerFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to create provider stats CSV file: %w", err)
+	}
+	defer providerFile.Close()
+
+	providerWriter := csv.NewWriter(providerFile)
+	defer providerWriter.Flush()
+
+	err = providerWriter.Write([]string{"Provider ID", "Bags Num", "Waiting download", "Proof long time ago", "Per day"})
+	if err != nil {
+		return fmt.Errorf("failed to write provider stats header: %w", err)
+	}
+
+	for _, p := range providerStats {
+		err = providerWriter.Write([]string{
+			p.ID,
+			fmt.Sprint(p.BagsNum),
+			fmt.Sprint(p.WaitingForBag),
+			fmt.Sprint(!p.ProofLongTimeAgo),
+			tlb.FromNanoTON(p.TotalPerDay).String(),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to write provider stats row: %w", err)
+		}
+	}
+
+	bagFile, err := os.Create(bagFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to create bag stats CSV file: %w", err)
+	}
+	defer bagFile.Close()
+
+	bagWriter := csv.NewWriter(bagFile)
+	defer bagWriter.Flush()
+
+	err = bagWriter.Write([]string{"Bag ID", "Contract", "Balance", "Providers", "Price per day"})
+	if err != nil {
+		return fmt.Errorf("failed to write bag stats header: %w", err)
+	}
+
+	for _, b := range bagStats {
+		err = bagWriter.Write([]string{
+			b.ID,
+			b.Contract,
+			fmt.Sprint(b.Balance),
+			fmt.Sprint(b.ProvidersNum),
+			tlb.FromNanoTON(b.TotalPerDay).String(),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to write bag stats row: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func initWallet(apiClient wallet.TonAPI, key ed25519.PrivateKey) (*wallet.Wallet, error) {
