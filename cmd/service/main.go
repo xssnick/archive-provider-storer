@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -83,6 +84,7 @@ var replicas = flag.Int("replicas", 3, "Providers per bag")
 var maxBagsPerProvider = flag.Int("max-bags-per-provider", 10, "Max bags per provider")
 var enableStats = flag.Bool("enable-stats", false, "Enable stats write to csv")
 var noTx = flag.Bool("no-tx", false, "Disable transactions")
+var noRemoveBag = flag.Bool("no-remove-bag", false, "Not remove bag after header save")
 
 var minBalance, maxBalance, gasFeeAdd, maxPerMB, minRewardToVerify tlb.Coins
 
@@ -215,48 +217,132 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 	var providers []*Provider
 	var details []*storage.BagDetailed
 
-	log.Info().Msg("loading bags")
+	// Load details from a JSON file
+	detailsFile, err := os.Open("bags.json")
+	if os.IsNotExist(err) {
+		detailsFile, err = os.Create("bags.json")
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to create bags.json file")
+			return fromBlock, err
+		}
+
+		data, err := json.Marshal([]*storage.BagDetailed{})
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to marshal empty array to JSON")
+			return fromBlock, err
+		}
+
+		if _, err = detailsFile.Write(data); err != nil {
+			log.Fatal().Err(err).Msg("failed to write empty array JSON to bags.json file")
+			return fromBlock, err
+		}
+	} else if err != nil {
+		log.Fatal().Err(err).Msg("failed to open bags.json file")
+		return fromBlock, err
+	} else {
+		if err := json.NewDecoder(detailsFile).Decode(&details); err != nil {
+			log.Fatal().Err(err).Msg("failed to decode details from JSON file")
+			return fromBlock, err
+		}
+	}
+	defer detailsFile.Close()
+
+	log.Info().Int("preloaded", len(details)).Msg("loading bags")
 
 	if len(bags) > *limitBags && *limitBags > 0 {
 		bags = bags[:*limitBags]
 	}
 
-next:
+	sem := make(chan struct{}, 10)
+
+	var mx sync.Mutex
+	wg := sync.WaitGroup{}
 	for _, b := range bags {
-		bag, err := hex.DecodeString(b)
-		if err != nil {
-			log.Error().Err(err).Str("bag", b).Msg("failed to decode bag")
-			continue
-		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
 
-		log.Debug().Msgf("loading bag %s", b)
-
-		for {
-			detail, err := storageClient.GetBag(context.Background(), bag)
+			bag, err := hex.DecodeString(b)
 			if err != nil {
-				if errors.Is(err, storage.ErrNotFound) {
-					log.Info().Msgf("downloading header of %s", b)
-					if err = storageClient.StartDownload(context.Background(), bag, false); err != nil {
-						log.Error().Err(err).Str("bag", b).Msg("failed to download header")
-						continue next
-					}
-				} else {
-					log.Error().Err(err).Str("bag", b).Msg("failed to get bag")
-					continue next
+				log.Fatal().Err(err).Str("bag", b).Msg("failed to decode bag")
+			}
+
+			mx.Lock()
+			for _, detail := range details {
+				if detail.BagID == b {
+					// exists
+					mx.Unlock()
+					return
 				}
 			}
+			mx.Unlock()
 
-			if detail == nil || !detail.HeaderLoaded {
-				log.Debug().Msgf("waiting bag %s", b)
+			log.Debug().Msgf("loading bag %s", b)
 
-				time.Sleep(500 * time.Millisecond)
-				continue
+			for {
+				detail, err := storageClient.GetBag(context.Background(), bag)
+				if err != nil {
+					if errors.Is(err, storage.ErrNotFound) {
+						log.Info().Msgf("downloading header of %s", b)
+						if err = storageClient.StartDownload(context.Background(), bag, false); err != nil {
+							log.Error().Err(err).Str("bag", b).Msg("failed to download header")
+							time.Sleep(500 * time.Millisecond)
+							continue
+						}
+					} else {
+						log.Error().Err(err).Str("bag", b).Msg("failed to get bag")
+						time.Sleep(500 * time.Millisecond)
+						continue
+					}
+				}
+
+				if detail == nil || !detail.HeaderLoaded {
+					log.Debug().Msgf("waiting bag %s", b)
+
+					time.Sleep(500 * time.Millisecond)
+					continue
+				}
+
+				if !*noRemoveBag {
+					if err = storageClient.RemoveBag(context.Background(), bag, false); err != nil {
+						log.Error().Err(err).Str("bag", b).Msg("failed to remove bag")
+					}
+				}
+
+				// for smaller size
+				detail.Files = nil
+				detail.Peers = nil
+				detail.Path = ""
+				detail.HasPiecesMask = nil
+
+				mx.Lock()
+				details = append(details, detail)
+
+				data, err := json.Marshal(details)
+				if err != nil {
+					log.Fatal().Err(err).Msg("failed to marshal bags to JSON")
+				}
+
+				if err = detailsFile.Truncate(0); err != nil {
+					log.Fatal().Err(err).Msg("failed to truncate bags.json file")
+				}
+				if _, err = detailsFile.Seek(0, 0); err != nil {
+					log.Fatal().Err(err).Msg("failed to seek to the beginning of bags.json file")
+				}
+				if _, err = detailsFile.Write(data); err != nil {
+					log.Fatal().Err(err).Msg("failed to write JSON to bags.json file")
+				}
+				_ = detailsFile.Sync()
+				mx.Unlock()
+				break
 			}
-
-			details = append(details, detail)
-			break
-		}
+		}()
 	}
+	wg.Wait()
 
 	log.Info().Msg("fetching providers")
 
