@@ -218,7 +218,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 	var details []*storage.BagDetailed
 
 	// Load details from a JSON file
-	detailsFile, err := os.Open("bags.json")
+	detailsFile, err := os.OpenFile("bags.json", os.O_RDWR, 0644)
 	if os.IsNotExist(err) {
 		detailsFile, err = os.Create("bags.json")
 		if err != nil {
