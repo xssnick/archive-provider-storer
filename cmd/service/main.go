@@ -41,7 +41,7 @@ import (
 type Provider struct {
 	ID            []byte
 	BagsNum       int
-	WaitingForBag bool
+	WaitingForBag string
 }
 
 type StatBag struct {
@@ -55,7 +55,7 @@ type StatBag struct {
 type StatProvider struct {
 	ID               string
 	BagsNum          int
-	WaitingForBag    bool
+	WaitingForBag    string
 	ProofLongTimeAgo bool
 	TotalPerDay      *big.Int
 }
@@ -437,8 +437,8 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 				ps.BagsNum++
 				ps.TotalPerDay.Add(ps.TotalPerDay, perDay)
 
-				if !ps.WaitingForBag {
-					ps.WaitingForBag = cp.LastProofAt.IsZero()
+				if ps.WaitingForBag == "" && cp.LastProofAt.IsZero() {
+					ps.WaitingForBag = dt.BagID
 				}
 
 				if !ps.ProofLongTimeAgo && !cp.LastProofAt.IsZero() {
@@ -544,7 +544,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 				// still downloading or not responding, remove provider from list for this loop, to not give him a new bag
 				for _, pv := range providers {
 					if bytes.Equal(pv.ID, prv.Key) {
-						pv.WaitingForBag = true
+						pv.WaitingForBag = dt.BagID
 						break
 					}
 				}
@@ -582,8 +582,8 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 				if len(newProviders) == *replicas {
 					break
 				}
-				if prv.WaitingForBag {
-					log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("provider is waiting for another bag confirmation")
+				if prv.WaitingForBag != "" {
+					log.Debug().Str("bag", dt.BagID).Str("waiting", prv.WaitingForBag).Hex("provider", prv.ID).Msg("provider is waiting for another bag confirmation")
 					continue
 				}
 
@@ -652,7 +652,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 				})
 
 				// remove provider for this loop, to not give him a new bag until he downloads it
-				prv.WaitingForBag = true
+				prv.WaitingForBag = dt.BagID
 				addedProviders[base64.StdEncoding.EncodeToString(prv.ID)+"_"+dt.BagID] = time.Now()
 
 				providerUpdated = true
