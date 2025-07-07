@@ -430,7 +430,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 				ps := providerStats[hex.EncodeToString(cp.Key)]
 				if ps == nil {
 					ps = &StatProvider{
-						ID:          dt.BagID,
+						ID:          hex.EncodeToString(cp.Key),
 						TotalPerDay: big.NewInt(0),
 					}
 					providerStats[hex.EncodeToString(cp.Key)] = ps
