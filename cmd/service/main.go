@@ -191,6 +191,7 @@ var addedProviders = make(map[string]time.Time)
 func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *transport.Client, api ton.APIClientWrapped, idxUrl, providersUrl string, fromBlock uint32) (uint32, error) {
 	bagStats := make(map[string]*StatBag)
 	providerStats := make(map[string]*StatProvider)
+	noRespCache := make(map[string]bool)
 
 	hCli := http.Client{Timeout: 10 * time.Second}
 	resp, err := hCli.Get(idxUrl)
@@ -529,15 +530,21 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 				Str("per_mb", prv.RatePerMB.String()).Uint32("span", prv.MaxSpan).Uint64("sz_gb", dt.BagSize>>30).Msg("requesting provider info")
 
 			var suspect bool
-			ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
-			stResp, err := providerClient.RequestStorageInfo(ctx, prv.Key, addr, toProof)
-			cancel()
-			if err != nil {
+			if !noRespCache[string(prv.Key)] {
+				ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+				stResp, err := providerClient.RequestStorageInfo(ctx, prv.Key, addr, toProof)
+				cancel()
+				if err != nil {
+					noRespCache[string(prv.Key)] = true
+					suspect = true
+					log.Warn().Err(err).Str("bag", dt.BagID).Hex("provider", prv.Key).Msg("failed to get storage info")
+				} else if stResp.Status != "active" || verifyStorageProof(id, dt.BagSize, stResp.Proof, toProof, dt.PieceSize) {
+					suspect = true
+					log.Debug().Str("bag", dt.BagID).Hex("provider", prv.Key).Str("status", stResp.Status).Str("reason", stResp.Reason).Msg("waiting for bag confirmation")
+				}
+			} else {
 				suspect = true
-				log.Warn().Err(err).Str("bag", dt.BagID).Hex("provider", prv.Key).Msg("failed to get storage info")
-			} else if stResp.Status != "active" || verifyStorageProof(id, dt.BagSize, stResp.Proof, toProof, dt.PieceSize) {
-				suspect = true
-				log.Debug().Str("bag", dt.BagID).Hex("provider", prv.Key).Str("status", stResp.Status).Str("reason", stResp.Reason).Msg("waiting for bag confirmation")
+				log.Debug().Str("bag", dt.BagID).Hex("provider", prv.Key).Msg("skipped, not respond before (cached)")
 			}
 
 			if suspect {
