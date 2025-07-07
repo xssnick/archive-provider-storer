@@ -608,10 +608,16 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 
 				log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("requesting provider storage rates")
 
+				if noRespCache[string(prv.ID)] {
+					log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("skipped, not respond before (cached)")
+					continue
+				}
+
 				ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
 				rates, err := providerClient.GetStorageRates(ctx, prv.ID, dt.BagSize)
 				cancel()
 				if err != nil {
+					noRespCache[string(prv.ID)] = true
 					log.Error().Err(err).Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("failed to get rates")
 					continue
 				}
