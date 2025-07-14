@@ -438,11 +438,12 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 				ps.BagsNum++
 				ps.TotalPerDay.Add(ps.TotalPerDay, perDay)
 
-				if ps.WaitingForBag == "" && cp.LastProofAt.IsZero() {
+				oldUnix := time.Unix(1, 0)
+				if ps.WaitingForBag == "" && cp.LastProofAt.Before(oldUnix) {
 					ps.WaitingForBag = dt.BagID
 				}
 
-				if !ps.ProofLongTimeAgo && !cp.LastProofAt.IsZero() {
+				if !ps.ProofLongTimeAgo && !cp.LastProofAt.Before(oldUnix) {
 					ps.ProofLongTimeAgo = cp.LastProofAt.Before(time.Now().Add(-time.Duration(cp.MaxSpan) * time.Second))
 				}
 
