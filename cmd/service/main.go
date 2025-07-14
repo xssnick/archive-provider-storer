@@ -406,7 +406,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		master, err := ac.CurrentMasterchainInfo(ctx)
+		master, err := ac.GetMasterchainInfo(ctx)
 		cancel()
 		if err != nil {
 			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to get masterchain info")
@@ -501,7 +501,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 		log.Info().Str("id", dt.BagID).Str("addr", addr.String()).Msg("getting contract")
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		master, err := ac.CurrentMasterchainInfo(ctx)
+		master, err := ac.GetMasterchainInfo(ctx)
 		cancel()
 		if err != nil {
 			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to get masterchain info")
@@ -722,7 +722,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 		if err != nil {
 			return 0, fmt.Errorf("failed to send messages: %w", err)
 		}
-		fromBlock = block.SeqNo
+		fromBlock = block.SeqNo + 1
 
 		log.Info().Str("hash", base64.StdEncoding.EncodeToString(tx.Hash)).Int("messages", len(messages)).Msg("executed transaction")
 	}
