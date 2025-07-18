@@ -471,6 +471,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 
 	log.Info().Msg("checking bags providers")
 
+	needBalance := tlb.MustFromTON("0.05")
 	var messages []*wallet.Message
 	for _, dt := range details {
 		if len(messages) >= 100 {
@@ -685,6 +686,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 					amt = *amt.MustAdd(maxBalance.MustSub(&balance))
 				}
 
+				needBalance = *needBalance.MustAdd(&amt)
 				messages = append(messages, &wallet.Message{
 					Mode: 1 + 2,
 					InternalMessage: &tlb.InternalMessage{
@@ -705,6 +707,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 
 			log.Info().Str("addr", addr.String()).Int("providers", len(validProviders)).Str("bag", dt.BagID).Str("topup", topupAmt.String()).Msg("adding message")
 
+			needBalance = *needBalance.MustAdd(topupAmt)
 			messages = append(messages, &wallet.Message{
 				Mode: 1 + 2,
 				InternalMessage: &tlb.InternalMessage{
@@ -718,6 +721,23 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 	}
 
 	if len(messages) > 0 && !*noTx {
+		master, err := ac.GetMasterchainInfo(context.Background())
+		if err != nil {
+			log.Error().Err(err).Msg("failed to get masterchain info for tx")
+			return 0, err
+		}
+
+		balance, err := wl.GetBalance(context.Background(), master)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to wallet get balance")
+			return 0, err
+		}
+
+		if balance.LessThan(&needBalance) {
+			log.Error().Err(err).Str("balance", balance.String()).Str("need", needBalance.String()).Msg("not enough balance for tx")
+			return 0, err
+		}
+
 		tx, block, err := wl.SendManyWaitTransaction(context.Background(), messages)
 		if err != nil {
 			return 0, fmt.Errorf("failed to send messages: %w", err)
