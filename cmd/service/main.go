@@ -758,7 +758,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 		fromBlock = block.SeqNo + 1
 
 		go func(notifications []*NotifyProvider) {
-			time.Sleep(10 * time.Second)
+			time.Sleep(20 * time.Second)
 			for _, notify := range notifications {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				_, err := providerClient.RequestStorageInfo(ctx, notify.ID, notify.Address, notify.ToProof)
