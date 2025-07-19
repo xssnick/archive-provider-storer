@@ -66,6 +66,12 @@ type MTPResponse struct {
 	} `json:"providers"`
 }
 
+type NotifyProvider struct {
+	ID      []byte
+	Address *address.Address
+	ToProof uint64
+}
+
 var minBalanceStr = flag.String("min-contract-balance", "0.3", "Minimum contract balance to topup")
 var maxBalanceStr = flag.String("contract-balance", "1", "Contract balance to maintain")
 var gasFeeAddStr = flag.String("gas-fee", "0.05", "Additional gas fee per tx")
@@ -472,6 +478,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 	log.Info().Msg("checking bags providers")
 
 	needBalance := tlb.MustFromTON("0.05")
+	var notifications []*NotifyProvider
 	var messages []*wallet.Message
 	for _, dt := range details {
 		if len(messages) >= 100 {
@@ -665,6 +672,11 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 					MaxSpan:       offer.Span,
 					PricePerMBDay: tlb.FromNanoTON(offer.RatePerMBNano),
 				})
+				notifications = append(notifications, &NotifyProvider{
+					ID:      prv.ID,
+					Address: addr,
+					ToProof: uint64(rand.Int()) % dt.BagSize,
+				})
 
 				// remove provider for this loop, to not give him a new bag until he downloads it
 				prv.WaitingForBag = dt.BagID
@@ -743,6 +755,14 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 			return 0, fmt.Errorf("failed to send messages: %w", err)
 		}
 		fromBlock = block.SeqNo + 1
+
+		go func(notifications []*NotifyProvider) {
+			time.Sleep(10 * time.Second)
+			for _, notify := range notifications {
+				_, _ = providerClient.RequestStorageInfo(context.Background(), notify.ID, notify.Address, notify.ToProof)
+				log.Debug().Hex("provider", notify.ID).Str("addr", notify.Address.String()).Uint64("to_proof", notify.ToProof).Msg("sent notify to provider for start download")
+			}
+		}(notifications)
 
 		log.Info().Str("hash", base64.StdEncoding.EncodeToString(tx.Hash)).Int("messages", len(messages)).Msg("executed transaction")
 	}
