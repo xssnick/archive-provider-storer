@@ -11,6 +11,16 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
+	"math/big"
+	"math/rand"
+	"net/http"
+	"os"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/pterm/pterm"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -27,15 +37,6 @@ import (
 	"github.com/xssnick/tonutils-storage-provider/pkg/storage"
 	"github.com/xssnick/tonutils-storage-provider/pkg/transport"
 	"github.com/xssnick/tonutils-storage/provider"
-	"math"
-	"math/big"
-	"math/rand"
-	"net/http"
-	"os"
-	"sort"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
 type Provider struct {
@@ -64,6 +65,12 @@ type MTPResponse struct {
 	Providers []struct {
 		PubKey string `json:"pubkey"`
 	} `json:"providers"`
+}
+
+type NotifyProvider struct {
+	ID      []byte
+	Address *address.Address
+	ToProof uint64
 }
 
 var minBalanceStr = flag.String("min-contract-balance", "0.3", "Minimum contract balance to topup")
@@ -472,6 +479,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 	log.Info().Msg("checking bags providers")
 
 	needBalance := tlb.MustFromTON("0.05")
+	var notifications []*NotifyProvider
 	var messages []*wallet.Message
 	for _, dt := range details {
 		if len(messages) >= 100 {
@@ -665,6 +673,11 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 					MaxSpan:       offer.Span,
 					PricePerMBDay: tlb.FromNanoTON(offer.RatePerMBNano),
 				})
+				notifications = append(notifications, &NotifyProvider{
+					ID:      prv.ID,
+					Address: addr,
+					ToProof: uint64(rand.Int()) % dt.BagSize,
+				})
 
 				// remove provider for this loop, to not give him a new bag until he downloads it
 				prv.WaitingForBag = dt.BagID
@@ -743,6 +756,20 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 			return 0, fmt.Errorf("failed to send messages: %w", err)
 		}
 		fromBlock = block.SeqNo + 1
+
+		go func(notifications []*NotifyProvider) {
+			time.Sleep(20 * time.Second)
+			for _, notify := range notifications {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_, err := providerClient.RequestStorageInfo(ctx, notify.ID, notify.Address, notify.ToProof)
+				cancel()
+				if err != nil {
+					log.Warn().Err(err).Hex("provider", notify.ID).Str("addr", notify.Address.String()).Msg("failed send notify to provider")
+				} else {
+					log.Debug().Hex("provider", notify.ID).Str("addr", notify.Address.String()).Uint64("to_proof", notify.ToProof).Msg("sent notify to provider for start download")
+				}
+			}
+		}(notifications)
 
 		log.Info().Str("hash", base64.StdEncoding.EncodeToString(tx.Hash)).Int("messages", len(messages)).Msg("executed transaction")
 	}
