@@ -11,6 +11,16 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
+	"math/big"
+	"math/rand"
+	"net/http"
+	"os"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/pterm/pterm"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -27,15 +37,6 @@ import (
 	"github.com/xssnick/tonutils-storage-provider/pkg/storage"
 	"github.com/xssnick/tonutils-storage-provider/pkg/transport"
 	"github.com/xssnick/tonutils-storage/provider"
-	"math"
-	"math/big"
-	"math/rand"
-	"net/http"
-	"os"
-	"sort"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
 type Provider struct {
@@ -759,8 +760,14 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 		go func(notifications []*NotifyProvider) {
 			time.Sleep(10 * time.Second)
 			for _, notify := range notifications {
-				_, _ = providerClient.RequestStorageInfo(context.Background(), notify.ID, notify.Address, notify.ToProof)
-				log.Debug().Hex("provider", notify.ID).Str("addr", notify.Address.String()).Uint64("to_proof", notify.ToProof).Msg("sent notify to provider for start download")
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_, err := providerClient.RequestStorageInfo(ctx, notify.ID, notify.Address, notify.ToProof)
+				cancel()
+				if err != nil {
+					log.Warn().Err(err).Hex("provider", notify.ID).Str("addr", notify.Address.String()).Msg("failed send notify to provider")
+				} else {
+					log.Debug().Hex("provider", notify.ID).Str("addr", notify.Address.String()).Uint64("to_proof", notify.ToProof).Msg("sent notify to provider for start download")
+				}
 			}
 		}(notifications)
 
