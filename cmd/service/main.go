@@ -73,8 +73,7 @@ type NotifyProvider struct {
 	ToProof uint64
 }
 
-var minBalanceStr = flag.String("min-contract-balance", "0.3", "Minimum contract balance to topup")
-var maxBalanceStr = flag.String("contract-balance", "1", "Contract balance to maintain")
+var contractBalanceStr = flag.String("contract-balance", "1", "Contract balance to maintain")
 var gasFeeAddStr = flag.String("gas-fee", "0.05", "Additional gas fee per tx")
 var maxSpanAllowed = flag.Int("max-span", 86400*14, "Maximum span allowed sec")
 var maxPerMBStr = flag.String("max-per-mb", "0.00015", "Maximum price per MB")
@@ -93,13 +92,12 @@ var enableStats = flag.Bool("enable-stats", false, "Enable stats write to csv")
 var noTx = flag.Bool("no-tx", false, "Disable transactions")
 var noRemoveBag = flag.Bool("no-remove-bag", false, "Not remove bag after header save")
 
-var minBalance, maxBalance, gasFeeAdd, maxPerMB, minRewardToVerify tlb.Coins
+var contractBalance, gasFeeAdd, maxPerMB, minRewardToVerify tlb.Coins
 
 func main() {
 	flag.Parse()
 
-	minBalance = tlb.MustFromTON(*minBalanceStr)
-	maxBalance = tlb.MustFromTON(*maxBalanceStr)
+	contractBalance = tlb.MustFromTON(*contractBalanceStr)
 	gasFeeAdd = tlb.MustFromTON(*gasFeeAddStr)
 	maxPerMB = tlb.MustFromTON(*maxPerMBStr)
 	minRewardToVerify = tlb.MustFromTON(*minRewardToVerifyStr)
@@ -527,6 +525,8 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 			continue
 		}
 
+		minBalance := tlb.ZeroCoins
+		maxBalance := tlb.ZeroCoins
 		var validProviders []contract.ProviderDataV1
 		for _, prv := range curProviders {
 			existsInList := false
@@ -582,6 +582,16 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 			}
 
 			validProviders = append(validProviders, prv)
+
+			bounty := new(big.Int).Mul(prv.RatePerMB.Nano(), big.NewInt(int64(dt.BagSize)))
+			bounty = bounty.Mul(bounty, big.NewInt(int64(prv.MaxSpan)))
+			bounty = bounty.Div(bounty, big.NewInt(24*60*60*1024*1024))
+
+			amt := tlb.MustFromNano(bounty, 9)
+			maxBalance = *maxBalance.MustAdd(&amt)
+			if amt.GreaterThan(&minBalance) {
+				minBalance = amt
+			}
 		}
 
 		if len(validProviders) < *replicas {
@@ -681,11 +691,25 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 					ToProof: uint64(rand.Int()) % dt.BagSize,
 				})
 
+				bounty := new(big.Int).Mul(tlb.FromNanoTON(offer.RatePerMBNano).Nano(), big.NewInt(int64(dt.BagSize)))
+				bounty = bounty.Mul(bounty, big.NewInt(int64(offer.Span)))
+				bounty = bounty.Div(bounty, big.NewInt(24*60*60*1024*1024))
+
+				amt := tlb.MustFromNano(bounty, 9)
+				maxBalance = *maxBalance.MustAdd(&amt)
+				if amt.GreaterThan(&minBalance) {
+					minBalance = amt
+				}
+
 				// remove provider for this loop, to not give him a new bag until he downloads it
 				prv.WaitingForBag = dt.BagID
 				addedProviders[base64.StdEncoding.EncodeToString(prv.ID)+"_"+dt.BagID] = time.Now()
 
 				providerUpdated = true
+			}
+
+			if maxBalance.Nano().Cmp(contractBalance.Nano()) < 0 {
+				maxBalance = contractBalance
 			}
 
 			if providerUpdated {
@@ -719,6 +743,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 
 		if len(validProviders) > 0 && balance.LessThan(&minBalance) {
 			topupAmt := maxBalance.MustSub(&balance)
+			topupAmt = topupAmt.MustAdd(&gasFeeAdd)
 
 			log.Info().Str("addr", addr.String()).Int("providers", len(validProviders)).Str("bag", dt.BagID).Str("topup", topupAmt.String()).Msg("adding message")
 
