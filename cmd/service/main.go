@@ -353,7 +353,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 	log.Info().Msg("fetching providers")
 
 	respProviders, err := hCli.Post(providersUrl, "application/json", bytes.NewBuffer([]byte(`{
-		"filter": {
+		"filters": {
 			"uptime_gt_percent": 40
 		},
 		"sort": {
@@ -529,14 +529,6 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 		maxBalance := tlb.ZeroCoins
 		var validProviders []contract.ProviderDataV1
 		for _, prv := range curProviders {
-			existsInList := false
-			for _, p := range providers {
-				if bytes.Equal(prv.Key, p.ID) {
-					existsInList = true
-					break
-				}
-			}
-
 			toProof := uint64(rand.Int()) % dt.BagSize
 			log.Debug().Str("bag", dt.BagID).Hex("provider", prv.Key).
 				Str("per_mb", prv.RatePerMB.String()).Uint32("span", prv.MaxSpan).Uint64("sz_gb", dt.BagSize>>30).Msg("requesting provider info")
@@ -570,6 +562,14 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 
 				maxDelay := time.Duration(prv.MaxSpan*2) * time.Second
 				if prv.LastProofAt.Add(maxDelay).Before(time.Now()) && time.Since(addedProviders[base64.StdEncoding.EncodeToString(prv.Key)+"_"+dt.BagID]) > 2*time.Hour {
+					existsInList := false
+					for _, p := range providers {
+						if bytes.Equal(prv.Key, p.ID) {
+							existsInList = true
+							break
+						}
+					}
+
 					// no proofs for too long, and not in list, removing it
 					if !existsInList {
 						log.Warn().Str("bag", dt.BagID).Hex("provider", prv.Key).Msg("last proof too long ago, and provider not in list anymore, removing")
