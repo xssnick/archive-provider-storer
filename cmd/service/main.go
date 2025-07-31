@@ -353,7 +353,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 	log.Info().Msg("fetching providers")
 
 	respProviders, err := hCli.Post(providersUrl, "application/json", bytes.NewBuffer([]byte(`{
-		"filter": {
+		"filters": {
 			"uptime_gt_percent": 40
 		},
 		"sort": {
