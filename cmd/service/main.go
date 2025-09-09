@@ -587,6 +587,14 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 			bounty = bounty.Mul(bounty, big.NewInt(int64(prv.MaxSpan)))
 			bounty = bounty.Div(bounty, big.NewInt(24*60*60*1024*1024))
 
+			if bounty.Cmp(minRewardToVerify.Nano()) > 0 {
+				// not typical price, check per mb
+				if prv.RatePerMB.Nano().Cmp(maxPerMB.Nano()) > 0 {
+					log.Warn().Str("bag", dt.BagID).Hex("provider", prv.Key).Str("rate", prv.RatePerMB.String()).Msg("rate of existing provider is too high, removing")
+					continue
+				}
+			}
+
 			amt := tlb.MustFromNano(bounty, 9)
 			maxBalance = *maxBalance.MustAdd(&amt)
 			if amt.GreaterThan(&minBalance) {
