@@ -581,8 +581,6 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 				log.Info().Str("bag", dt.BagID).Hex("provider", prv.Key).Msg("storage confirmed")
 			}
 
-			validProviders = append(validProviders, prv)
-
 			bounty := new(big.Int).Mul(prv.RatePerMB.Nano(), big.NewInt(int64(dt.BagSize)))
 			bounty = bounty.Mul(bounty, big.NewInt(int64(prv.MaxSpan)))
 			bounty = bounty.Div(bounty, big.NewInt(24*60*60*1024*1024))
@@ -600,6 +598,8 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 			if amt.GreaterThan(&minBalance) {
 				minBalance = amt
 			}
+
+			validProviders = append(validProviders, prv)
 		}
 
 		if len(validProviders) < *replicas {
