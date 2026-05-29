@@ -91,8 +91,66 @@ var maxBagsPerProvider = flag.Int("max-bags-per-provider", 10, "Max bags per pro
 var enableStats = flag.Bool("enable-stats", false, "Enable stats write to csv")
 var noTx = flag.Bool("no-tx", false, "Disable transactions")
 var noRemoveBag = flag.Bool("no-remove-bag", false, "Not remove bag after header save")
+var skipLiteserverHealthCheck = flag.Bool("skip-liteserver-health-check", false, "Skip startup lite server masterchain seqno health check")
+var maxLiteserverLag = flag.Uint("max-liteserver-lag", 512, "Max lite server masterchain seqno lag behind the best server during startup health check")
 
 var contractBalance, gasFeeAdd, maxPerMB, minRewardToVerify tlb.Coins
+
+const (
+	liteserverRequestTimeout = 15 * time.Second
+	masterchainPollInterval  = 2 * time.Second
+	walletTxScanLimit        = 100
+)
+
+type freshWalletAPI struct {
+	ton.APIClientWrapped
+}
+
+type txConfirmationTimeoutError struct {
+	nextSeqno uint32
+}
+
+func (e *txConfirmationTimeoutError) Error() string {
+	return ton.ErrTxWasNotConfirmed.Error()
+}
+
+func (e *txConfirmationTimeoutError) Unwrap() error {
+	return ton.ErrTxWasNotConfirmed
+}
+
+type loopWallet interface {
+	WalletAddress() *address.Address
+	GetBalance(context.Context, *ton.BlockIDExt) (tlb.Coins, error)
+	BuildExternalMessageForMany(context.Context, []*wallet.Message) (*tlb.ExternalMessage, error)
+}
+
+type storageAPI interface {
+	GetBag(context.Context, []byte) (*storage.BagDetailed, error)
+	StartDownload(context.Context, []byte, bool) error
+	RemoveBag(context.Context, []byte, bool) error
+}
+
+type providerAPI interface {
+	RequestStorageInfo(context.Context, []byte, *address.Address, uint64) (*transport.StorageResponse, error)
+	GetStorageRates(context.Context, []byte, uint64) (*transport.StorageRatesResponse, error)
+}
+
+type waitMasterFunc func(context.Context, ton.APIClientWrapped, uint32) (*ton.BlockIDExt, error)
+type sendManyWaitFunc func(context.Context, loopWallet, ton.APIClientWrapped, []*wallet.Message, uint32) (*tlb.Transaction, *ton.BlockIDExt, error)
+
+type loopDeps struct {
+	wallet       loopWallet
+	storage      storageAPI
+	provider     providerAPI
+	api          ton.APIClientWrapped
+	httpClient   *http.Client
+	waitMaster   waitMasterFunc
+	sendManyWait sendManyWaitFunc
+}
+
+func (api freshWalletAPI) CurrentMasterchainInfo(ctx context.Context) (*ton.BlockIDExt, error) {
+	return waitForMasterchainBlock(ctx, api.APIClientWrapped, 0)
+}
 
 func main() {
 	flag.Parse()
@@ -122,6 +180,9 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to get lite client config")
 		return
 	}
+	if !*skipLiteserverHealthCheck {
+		lsCfg = filterHealthyLiteservers(context.Background(), lsCfg, uint32(*maxLiteserverLag))
+	}
 
 	lsClient := liteclient.NewConnectionPool()
 	if err := lsClient.AddConnectionsFromConfig(context.Background(), lsCfg); err != nil {
@@ -132,7 +193,7 @@ func main() {
 	// initialize ton api lite connection wrapper with full proof checks
 	api := ton.NewAPIClient(lsClient, ton.ProofCheckPolicyFast).WithRetry()
 
-	wl, err := initWallet(api, ed25519.NewKeyFromSeed(walletKey))
+	wl, err := initWallet(freshWalletAPI{APIClientWrapped: api}, ed25519.NewKeyFromSeed(walletKey))
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to init wallet")
 		return
@@ -194,12 +255,39 @@ func main() {
 var addedProviders = make(map[string]time.Time)
 
 func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *transport.Client, api ton.APIClientWrapped, idxUrl, providersUrl string, fromBlock uint32) (uint32, error) {
+	return doLoopWithDeps(loopDeps{
+		wallet:       wl,
+		storage:      storageClient,
+		provider:     providerClient,
+		api:          api,
+		httpClient:   &http.Client{Timeout: 10 * time.Second},
+		waitMaster:   waitForMasterchainBlock,
+		sendManyWait: sendManyWaitTransactionFresh,
+	}, idxUrl, providersUrl, fromBlock)
+}
+
+func doLoopWithDeps(deps loopDeps, idxUrl, providersUrl string, fromBlock uint32) (uint32, error) {
 	bagStats := make(map[string]*StatBag)
 	providerStats := make(map[string]*StatProvider)
 	noRespCache := make(map[string]bool)
 
-	hCli := http.Client{Timeout: 10 * time.Second}
-	resp, err := hCli.Get(idxUrl)
+	if deps.httpClient == nil {
+		deps.httpClient = &http.Client{Timeout: 10 * time.Second}
+	}
+	if deps.waitMaster == nil {
+		deps.waitMaster = waitForMasterchainBlock
+	}
+	if deps.sendManyWait == nil {
+		deps.sendManyWait = sendManyWaitTransactionFresh
+	}
+
+	loopMaster, err := deps.waitMaster(context.Background(), deps.api, fromBlock)
+	if err != nil {
+		return fromBlock, fmt.Errorf("failed to get fresh masterchain block: %w", err)
+	}
+	log.Info().Uint32("seqno", loopMaster.SeqNo).Uint32("min_seqno", fromBlock).Msg("using masterchain block")
+
+	resp, err := deps.httpClient.Get(idxUrl)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get index: %w", err)
 	}
@@ -290,11 +378,11 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 			log.Debug().Msgf("loading bag %s", b)
 
 			for {
-				detail, err := storageClient.GetBag(context.Background(), bag)
+				detail, err := deps.storage.GetBag(context.Background(), bag)
 				if err != nil {
 					if errors.Is(err, storage.ErrNotFound) {
 						log.Info().Msgf("downloading header of %s", b)
-						if err = storageClient.StartDownload(context.Background(), bag, false); err != nil {
+						if err = deps.storage.StartDownload(context.Background(), bag, false); err != nil {
 							log.Error().Err(err).Str("bag", b).Msg("failed to download header")
 							time.Sleep(500 * time.Millisecond)
 							continue
@@ -314,7 +402,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 				}
 
 				if !*noRemoveBag {
-					if err = storageClient.RemoveBag(context.Background(), bag, false); err != nil {
+					if err = deps.storage.RemoveBag(context.Background(), bag, false); err != nil {
 						log.Error().Err(err).Str("bag", b).Msg("failed to remove bag")
 					}
 				}
@@ -352,7 +440,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 
 	log.Info().Msg("fetching providers")
 
-	respProviders, err := hCli.Post(providersUrl, "application/json", bytes.NewBuffer([]byte(`{
+	respProviders, err := deps.httpClient.Post(providersUrl, "application/json", bytes.NewBuffer([]byte(`{
 		"filters": {
 			"uptime_gt_percent": 40
 		},
@@ -388,11 +476,6 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 
 	log.Info().Msg("checking bags num stored")
 
-	ac := api
-	if fromBlock > 0 {
-		ac = api.WaitForBlock(fromBlock)
-	}
-
 	for _, dt := range details {
 		id, err := hex.DecodeString(dt.BagID)
 		if err != nil {
@@ -406,22 +489,14 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 			return 0, err
 		}
 
-		addr, _, _, err := contract.PrepareV1DeployData(id, mHash, dt.BagSize, dt.PieceSize, wl.WalletAddress(), nil)
+		addr, _, _, err := contract.PrepareV1DeployData(id, mHash, dt.BagSize, dt.PieceSize, deps.wallet.WalletAddress(), nil)
 		if err != nil {
 			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to calc contract address")
 			return 0, err
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		master, err := ac.GetMasterchainInfo(ctx)
-		cancel()
-		if err != nil {
-			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to get masterchain info")
-			return 0, err
-		}
-
-		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
-		curProviders, balance, err := contract.GetProvidersV1(ctx, api, master, addr)
+		curProviders, balance, err := contract.GetProvidersV1(ctx, deps.api, loopMaster, addr)
 		cancel()
 		if err != nil && !errors.Is(err, contract.ErrNotDeployed) {
 			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to get providers")
@@ -501,7 +576,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 			continue
 		}
 
-		addr, _, _, err := contract.PrepareV1DeployData(id, mHash, dt.BagSize, dt.PieceSize, wl.WalletAddress(), nil)
+		addr, _, _, err := contract.PrepareV1DeployData(id, mHash, dt.BagSize, dt.PieceSize, deps.wallet.WalletAddress(), nil)
 		if err != nil {
 			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to calc contract address")
 			continue
@@ -510,15 +585,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 		log.Info().Str("id", dt.BagID).Str("addr", addr.String()).Msg("getting contract")
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		master, err := ac.GetMasterchainInfo(ctx)
-		cancel()
-		if err != nil {
-			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to get masterchain info")
-			continue
-		}
-
-		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
-		curProviders, balance, err := contract.GetProvidersV1(ctx, api, master, addr)
+		curProviders, balance, err := contract.GetProvidersV1(ctx, deps.api, loopMaster, addr)
 		cancel()
 		if err != nil && !errors.Is(err, contract.ErrNotDeployed) {
 			log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to calc contract address")
@@ -536,13 +603,13 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 			var suspect bool
 			if !noRespCache[string(prv.Key)] {
 				ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
-				stResp, err := providerClient.RequestStorageInfo(ctx, prv.Key, addr, toProof)
+				stResp, err := deps.provider.RequestStorageInfo(ctx, prv.Key, addr, toProof)
 				cancel()
 				if err != nil {
 					noRespCache[string(prv.Key)] = true
 					suspect = true
 					log.Warn().Err(err).Str("bag", dt.BagID).Hex("provider", prv.Key).Msg("failed to get storage info")
-				} else if stResp.Status != "active" || verifyStorageProof(id, dt.BagSize, stResp.Proof, toProof, dt.PieceSize) {
+				} else if stResp.Status != "active" || !verifyStorageProof(mHash, dt.BagSize, stResp.Proof, toProof, dt.PieceSize) {
 					suspect = true
 					log.Debug().Str("bag", dt.BagID).Hex("provider", prv.Key).Str("status", stResp.Status).Str("reason", stResp.Reason).Msg("waiting for bag confirmation")
 				}
@@ -594,8 +661,8 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 			}
 
 			amt := tlb.MustFromNano(bounty, 9)
-			maxBalance = *maxBalance.MustAdd(&amt)
-			if amt.GreaterThan(&minBalance) {
+			maxBalance = maxBalance.MustAdd(amt)
+			if amt.GreaterThan(minBalance) {
 				minBalance = amt
 			}
 
@@ -644,7 +711,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 				}
 
 				ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
-				rates, err := providerClient.GetStorageRates(ctx, prv.ID, dt.BagSize)
+				rates, err := deps.provider.GetStorageRates(ctx, prv.ID, dt.BagSize)
 				cancel()
 				if err != nil {
 					noRespCache[string(prv.ID)] = true
@@ -704,8 +771,8 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 				bounty = bounty.Div(bounty, big.NewInt(24*60*60*1024*1024))
 
 				amt := tlb.MustFromNano(bounty, 9)
-				maxBalance = *maxBalance.MustAdd(&amt)
-				if amt.GreaterThan(&minBalance) {
+				maxBalance = maxBalance.MustAdd(amt)
+				if amt.GreaterThan(minBalance) {
 					minBalance = amt
 				}
 
@@ -721,7 +788,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 			}
 
 			if providerUpdated {
-				_, si, body, err := contract.PrepareV1DeployData(id, mHash, dt.BagSize, dt.PieceSize, wl.WalletAddress(), newProviders)
+				_, si, body, err := contract.PrepareV1DeployData(id, mHash, dt.BagSize, dt.PieceSize, deps.wallet.WalletAddress(), newProviders)
 				if err != nil {
 					log.Error().Err(err).Str("bag", dt.BagID).Msg("failed to calc deploy data")
 					continue
@@ -729,11 +796,11 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 
 				amt := gasFeeAdd
 
-				if balance.LessThan(&maxBalance) {
-					amt = *amt.MustAdd(maxBalance.MustSub(&balance))
+				if balance.LessThan(maxBalance) {
+					amt = amt.MustAdd(maxBalance.MustSub(balance))
 				}
 
-				needBalance = *needBalance.MustAdd(&amt)
+				needBalance = needBalance.MustAdd(amt)
 				messages = append(messages, &wallet.Message{
 					Mode: 1 + 2,
 					InternalMessage: &tlb.InternalMessage{
@@ -749,46 +816,62 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 			}
 		}
 
-		if len(validProviders) > 0 && balance.LessThan(&minBalance) {
-			topupAmt := maxBalance.MustSub(&balance)
-			topupAmt = topupAmt.MustAdd(&gasFeeAdd)
+		if len(validProviders) > 0 && balance.LessThan(minBalance) {
+			topupAmt := maxBalance.MustSub(balance)
+			topupAmt = topupAmt.MustAdd(gasFeeAdd)
 
 			log.Info().Str("addr", addr.String()).Int("providers", len(validProviders)).Str("bag", dt.BagID).Str("topup", topupAmt.String()).Msg("adding message")
 
-			needBalance = *needBalance.MustAdd(topupAmt)
+			needBalance = needBalance.MustAdd(topupAmt)
 			messages = append(messages, &wallet.Message{
 				Mode: 1 + 2,
 				InternalMessage: &tlb.InternalMessage{
 					IHRDisabled: true,
 					Bounce:      true, // expected to be deployed
 					DstAddr:     addr,
-					Amount:      *topupAmt,
+					Amount:      topupAmt,
 				},
 			})
 		}
 	}
 
 	if len(messages) > 0 && !*noTx {
-		master, err := ac.GetMasterchainInfo(context.Background())
+		if fromBlock <= loopMaster.SeqNo {
+			fromBlock = loopMaster.SeqNo + 1
+		}
+
+		master, err := deps.waitMaster(context.Background(), deps.api, loopMaster.SeqNo)
 		if err != nil {
 			log.Error().Err(err).Msg("failed to get masterchain info for tx")
-			return 0, err
+			return fromBlock, err
+		}
+		if fromBlock <= master.SeqNo {
+			fromBlock = master.SeqNo + 1
 		}
 
-		balance, err := wl.GetBalance(context.Background(), master)
+		balance, err := deps.wallet.GetBalance(context.Background(), master)
 		if err != nil {
 			log.Error().Err(err).Msg("failed to wallet get balance")
-			return 0, err
+			return fromBlock, err
 		}
 
-		if balance.LessThan(&needBalance) {
-			log.Error().Err(err).Str("balance", balance.String()).Str("need", needBalance.String()).Msg("not enough balance for tx")
-			return 0, err
+		if balance.LessThan(needBalance) {
+			err = fmt.Errorf("not enough balance for tx: balance %s, need %s", balance.String(), needBalance.String())
+			log.Error().Err(err).Msg("not enough balance for tx")
+			return fromBlock, err
 		}
 
-		tx, block, err := wl.SendManyWaitTransaction(context.Background(), messages)
+		tx, block, err := deps.sendManyWait(context.Background(), deps.wallet, deps.api, messages, master.SeqNo)
 		if err != nil {
-			return 0, fmt.Errorf("failed to send messages: %w", err)
+			var timeoutErr *txConfirmationTimeoutError
+			if errors.As(err, &timeoutErr) {
+				if fromBlock < timeoutErr.nextSeqno {
+					fromBlock = timeoutErr.nextSeqno
+				}
+				log.Warn().Uint32("from_block", fromBlock).Msg("transaction confirmation timed out; waiting for a newer masterchain block before rebuilding messages")
+				return fromBlock, nil
+			}
+			return fromBlock, fmt.Errorf("failed to send messages: %w", err)
 		}
 		fromBlock = block.SeqNo + 1
 
@@ -796,7 +879,7 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 			time.Sleep(20 * time.Second)
 			for _, notify := range notifications {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				_, err := providerClient.RequestStorageInfo(ctx, notify.ID, notify.Address, notify.ToProof)
+				_, err := deps.provider.RequestStorageInfo(ctx, notify.ID, notify.Address, notify.ToProof)
 				cancel()
 				if err != nil {
 					log.Warn().Err(err).Hex("provider", notify.ID).Str("addr", notify.Address.String()).Msg("failed send notify to provider")
@@ -833,7 +916,295 @@ func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *tr
 		}
 	}
 
+	if fromBlock <= loopMaster.SeqNo {
+		fromBlock = loopMaster.SeqNo + 1
+	}
 	return fromBlock, nil
+}
+
+func filterHealthyLiteservers(ctx context.Context, cfg *liteclient.GlobalConfig, maxLag uint32) *liteclient.GlobalConfig {
+	if cfg == nil || len(cfg.Liteservers) < 2 {
+		return cfg
+	}
+
+	type result struct {
+		index int
+		seqno uint32
+		err   error
+	}
+
+	results := make(chan result, len(cfg.Liteservers))
+	sem := make(chan struct{}, 16)
+	var wg sync.WaitGroup
+
+	for i, ls := range cfg.Liteservers {
+		i, ls := i, ls
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			seqno, err := checkLiteserverMasterSeqno(ctx, cfg, ls)
+			results <- result{index: i, seqno: seqno, err: err}
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	byIndex := make(map[int]result, len(cfg.Liteservers))
+	var bestSeqno uint32
+	for res := range results {
+		byIndex[res.index] = res
+		if res.err == nil && res.seqno > bestSeqno {
+			bestSeqno = res.seqno
+		}
+	}
+
+	if bestSeqno == 0 {
+		log.Warn().Msg("all lite server health checks failed, using original config")
+		return cfg
+	}
+
+	filtered := make([]liteclient.LiteserverConfig, 0, len(cfg.Liteservers))
+	for i, ls := range cfg.Liteservers {
+		res := byIndex[i]
+		addr := liteserverAddr(ls)
+		if res.err != nil {
+			log.Warn().Err(res.err).Str("addr", addr).Msg("lite server health check failed, excluding")
+			continue
+		}
+
+		lag := bestSeqno - res.seqno
+		if lag > maxLag {
+			log.Warn().
+				Str("addr", addr).
+				Uint32("seqno", res.seqno).
+				Uint32("best_seqno", bestSeqno).
+				Uint32("lag", lag).
+				Msg("excluding stale lite server")
+			continue
+		}
+
+		filtered = append(filtered, ls)
+	}
+
+	if len(filtered) == 0 {
+		log.Warn().Uint32("best_seqno", bestSeqno).Msg("no lite servers passed health check, using original config")
+		return cfg
+	}
+
+	log.Info().
+		Int("total", len(cfg.Liteservers)).
+		Int("healthy", len(filtered)).
+		Uint32("best_seqno", bestSeqno).
+		Msg("lite server health check completed")
+
+	next := *cfg
+	next.Liteservers = filtered
+	return &next
+}
+
+func checkLiteserverMasterSeqno(ctx context.Context, cfg *liteclient.GlobalConfig, ls liteclient.LiteserverConfig) (uint32, error) {
+	checkCtx, cancel := context.WithTimeout(ctx, liteserverRequestTimeout)
+	defer cancel()
+
+	one := *cfg
+	one.Liteservers = []liteclient.LiteserverConfig{ls}
+
+	pool := liteclient.NewConnectionPool()
+	defer pool.Stop()
+
+	if err := pool.AddConnectionsFromConfig(checkCtx, &one); err != nil {
+		return 0, err
+	}
+
+	api := ton.NewAPIClient(pool, ton.ProofCheckPolicyFast).WithRetry()
+	reqCtx, reqCancel := context.WithTimeout(ctx, liteserverRequestTimeout)
+	defer reqCancel()
+
+	master, err := api.GetMasterchainInfo(reqCtx)
+	if err != nil {
+		return 0, err
+	}
+	return master.SeqNo, nil
+}
+
+func waitForMasterchainBlock(ctx context.Context, api ton.APIClientWrapped, minSeqno uint32) (*ton.BlockIDExt, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	var lastLoggedSeqno uint32
+	for {
+		master, err := bestKnownMasterchainInfo(ctx, api)
+		if err == nil {
+			if minSeqno == 0 || master.SeqNo >= minSeqno {
+				return master, nil
+			}
+
+			if master.SeqNo != lastLoggedSeqno {
+				log.Warn().
+					Uint32("seqno", master.SeqNo).
+					Uint32("want_seqno", minSeqno).
+					Msg("masterchain block is behind, waiting")
+				lastLoggedSeqno = master.SeqNo
+			}
+		} else {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			log.Warn().Err(err).Uint32("want_seqno", minSeqno).Msg("failed to get masterchain block, retrying")
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(masterchainPollInterval):
+		}
+	}
+}
+
+func bestKnownMasterchainInfo(ctx context.Context, api ton.APIClientWrapped) (*ton.BlockIDExt, error) {
+	stickyCtx := api.Client().StickyContext(ctx)
+
+	var best *ton.BlockIDExt
+	var lastErr error
+	for {
+		reqCtx, cancel := context.WithTimeout(stickyCtx, liteserverRequestTimeout)
+		master, err := api.GetMasterchainInfo(reqCtx)
+		cancel()
+
+		if err != nil {
+			lastErr = err
+			log.Debug().Err(err).Msg("failed to get masterchain info from lite server")
+		} else if best == nil || master.SeqNo > best.SeqNo {
+			best = master
+		}
+
+		nextCtx, err := api.Client().StickyContextNextNode(stickyCtx)
+		if err != nil {
+			break
+		}
+		stickyCtx = nextCtx
+	}
+
+	if best != nil {
+		return best, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("no lite server returned masterchain info")
+}
+
+func sendManyWaitTransactionFresh(ctx context.Context, wl loopWallet, api ton.APIClientWrapped, messages []*wallet.Message, minSeqno uint32) (*tlb.Transaction, *ton.BlockIDExt, error) {
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 180*time.Second)
+		defer cancel()
+	}
+
+	ext, err := wl.BuildExternalMessageForMany(ctx, messages)
+	if err != nil {
+		return nil, nil, err
+	}
+	inMsgHash := ext.Body.Hash()
+
+	master, err := waitForMasterchainBlock(ctx, api, minSeqno)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err = api.SendExternalMessage(ctx, ext); err != nil {
+		return nil, nil, fmt.Errorf("failed to send message: %w", err)
+	}
+
+	log.Debug().
+		Str("hash", base64.StdEncoding.EncodeToString(inMsgHash)).
+		Uint32("from_seqno", master.SeqNo+1).
+		Msg("sent external message, waiting for wallet transaction")
+
+	return waitForWalletInMsg(ctx, api, wl.WalletAddress(), inMsgHash, master.SeqNo+1)
+}
+
+func waitForWalletInMsg(ctx context.Context, api ton.APIClientWrapped, addr *address.Address, inMsgHash []byte, minSeqno uint32) (*tlb.Transaction, *ton.BlockIDExt, error) {
+	nextSeqno := minSeqno
+	for {
+		if err := ctx.Err(); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, nil, &txConfirmationTimeoutError{nextSeqno: nextSeqno}
+			}
+			return nil, nil, err
+		}
+
+		master, err := waitForMasterchainBlock(ctx, api, nextSeqno)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, nil, &txConfirmationTimeoutError{nextSeqno: nextSeqno}
+			}
+			return nil, nil, err
+		}
+
+		tx, err := findWalletInMsgAtBlock(ctx, api, master, addr, inMsgHash)
+		if err == nil {
+			return tx, master, nil
+		}
+		if !errors.Is(err, ton.ErrTxWasNotFound) {
+			log.Warn().Err(err).Uint32("seqno", master.SeqNo).Msg("failed to scan wallet transactions")
+		}
+
+		nextSeqno = master.SeqNo + 1
+	}
+}
+
+func findWalletInMsgAtBlock(ctx context.Context, api ton.APIClientWrapped, master *ton.BlockIDExt, addr *address.Address, inMsgHash []byte) (*tlb.Transaction, error) {
+	acc, err := api.WaitForBlock(master.SeqNo).GetAccount(ctx, master, addr)
+	if err != nil {
+		return nil, fmt.Errorf("cannot get wallet account: %w", err)
+	}
+	if !acc.IsActive {
+		return nil, ton.ErrTxWasNotFound
+	}
+
+	scanned := 0
+	for lastLT, lastHash := acc.LastTxLT, acc.LastTxHash; ; {
+		if lastLT == 0 {
+			return nil, ton.ErrTxWasNotFound
+		}
+
+		txList, err := api.WaitForBlock(master.SeqNo).ListTransactions(ctx, addr, 15, lastLT, lastHash)
+		if err != nil {
+			if errors.Is(err, ton.ErrNoTransactionsWereFound) {
+				return nil, ton.ErrTxWasNotFound
+			}
+			return nil, fmt.Errorf("cannot list wallet transactions: %w", err)
+		}
+
+		for i, tx := range txList {
+			if i == 0 {
+				lastLT, lastHash = tx.PrevTxLT, tx.PrevTxHash
+			}
+			if tx.IO.In != nil && bytes.Equal(tx.IO.In.Msg.Payload().Hash(), inMsgHash) {
+				return tx, nil
+			}
+		}
+
+		scanned += len(txList)
+		if scanned >= walletTxScanLimit {
+			return nil, ton.ErrTxWasNotFound
+		}
+	}
+}
+
+func liteserverAddr(ls liteclient.LiteserverConfig) string {
+	return fmt.Sprintf("%d.%d.%d.%d:%d",
+		(ls.IP>>24)&0xff,
+		(ls.IP>>16)&0xff,
+		(ls.IP>>8)&0xff,
+		ls.IP&0xff,
+		ls.Port,
+	)
 }
 
 func exportStatsToCSV(providerStats []*StatProvider, bagStats []*StatBag, providerFilePath, bagFilePath string) error {
@@ -917,6 +1288,9 @@ func verifyStorageProof(hash []byte, sz uint64, proofBytes []byte, proofByte uin
 		if proofData, err := cell.UnwrapProof(proof, hash); err == nil {
 			piece := uint32(proofByte / uint64(pieceSz))
 			pieces := uint32(sz / uint64(pieceSz))
+			if sz%uint64(pieceSz) != 0 {
+				pieces++
+			}
 
 			if err = checkProofBranch(proofData, piece, pieces); err == nil {
 				return true
@@ -931,7 +1305,10 @@ func checkProofBranch(proof *cell.Cell, piece, piecesNum uint32) error {
 		return fmt.Errorf("piece is out of range %d/%d", piece, piecesNum)
 	}
 
-	tree := proof.BeginParse()
+	tree, err := proof.BeginParse()
+	if err != nil {
+		return err
+	}
 
 	// calc tree depth
 	depth := int(math.Log2(float64(piecesNum)))
