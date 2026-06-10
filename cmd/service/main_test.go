@@ -197,6 +197,64 @@ func TestDoLoopTxSendErrorReturnsNextBlockCheckpoint(t *testing.T) {
 	}
 }
 
+func TestDoLoopSkipsBagWhenHeaderWaitTimesOut(t *testing.T) {
+	withLoopTestEnv(t)
+	*replicas = 0
+	*noTx = true
+	bagHeaderWaitTimeout = 20 * time.Millisecond
+	bagHeaderPollInterval = 5 * time.Millisecond
+
+	bagID := hex.EncodeToString(testKey(0x77))
+	var providerRequests atomic.Int32
+	srv := newLoopHTTPServer(t, bagID, nil, &providerRequests)
+	defer srv.Close()
+
+	fStorage := &stuckHeaderStorage{}
+	deps := loopDeps{
+		wallet:     testWallet(tlb.MustFromTON("100")),
+		storage:    fStorage,
+		provider:   &fakeProvider{},
+		api:        &fakeAPI{},
+		httpClient: srv.Client(),
+		waitMaster: func(ctx context.Context, api ton.APIClientWrapped, minSeqno uint32) (*ton.BlockIDExt, error) {
+			return testMaster(100), nil
+		},
+		sendManyWait: func(ctx context.Context, wl loopWallet, api ton.APIClientWrapped, messages []*wallet.Message, minSeqno uint32) (*tlb.Transaction, *ton.BlockIDExt, error) {
+			t.Fatalf("unexpected transaction send with %d messages", len(messages))
+			return nil, nil, nil
+		},
+	}
+
+	next, err := doLoopWithDeps(deps, srv.URL+"/index", srv.URL+"/providers", 0)
+	if err != nil {
+		t.Fatalf("doLoopWithDeps returned error: %v", err)
+	}
+	if next != 101 {
+		t.Fatalf("next fromBlock mismatch: got %d, want 101", next)
+	}
+	if got := providerRequests.Load(); got != 1 {
+		t.Fatalf("providers HTTP calls mismatch: got %d, want 1", got)
+	}
+	if got := fStorage.startCalls.Load(); got != 1 {
+		t.Fatalf("StartDownload calls mismatch: got %d, want 1", got)
+	}
+	if got := fStorage.removeCalls.Load(); got != 0 {
+		t.Fatalf("RemoveBag calls mismatch: got %d, want 0", got)
+	}
+
+	var details []*storage.BagDetailed
+	data, err := os.ReadFile("bags.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &details); err != nil {
+		t.Fatal(err)
+	}
+	if len(details) != 0 {
+		t.Fatalf("timed out bag was cached despite missing header: got %d details", len(details))
+	}
+}
+
 func withLoopTestEnv(t *testing.T) {
 	t.Helper()
 
@@ -223,6 +281,8 @@ func withLoopTestEnv(t *testing.T) {
 	oldMaxPerMB := maxPerMB
 	oldMinRewardToVerify := minRewardToVerify
 	oldAddedProviders := addedProviders
+	oldBagHeaderWaitTimeout := bagHeaderWaitTimeout
+	oldBagHeaderPollInterval := bagHeaderPollInterval
 
 	*limitBags = 10
 	*limitProviders = 100
@@ -250,6 +310,8 @@ func withLoopTestEnv(t *testing.T) {
 		maxPerMB = oldMaxPerMB
 		minRewardToVerify = oldMinRewardToVerify
 		addedProviders = oldAddedProviders
+		bagHeaderWaitTimeout = oldBagHeaderWaitTimeout
+		bagHeaderPollInterval = oldBagHeaderPollInterval
 	})
 }
 
@@ -378,6 +440,39 @@ func (s *fakeStorage) StartDownload(ctx context.Context, bag []byte, downloadAll
 
 func (s *fakeStorage) RemoveBag(ctx context.Context, bag []byte, withFiles bool) error {
 	return fmt.Errorf("unexpected RemoveBag call for %x", bag)
+}
+
+type stuckHeaderStorage struct {
+	getCalls    atomic.Int32
+	startCalls  atomic.Int32
+	removeCalls atomic.Int32
+}
+
+func (s *stuckHeaderStorage) GetBag(ctx context.Context, bag []byte) (*storage.BagDetailed, error) {
+	call := s.getCalls.Add(1)
+	if call == 1 {
+		return nil, storage.ErrNotFound
+	}
+	return &storage.BagDetailed{
+		Bag: storage.Bag{
+			BagID:         hex.EncodeToString(bag),
+			InfoLoaded:    true,
+			HeaderLoaded:  false,
+			Active:        true,
+			Peers:         2,
+			DownloadSpeed: 42,
+		},
+	}, nil
+}
+
+func (s *stuckHeaderStorage) StartDownload(ctx context.Context, bag []byte, downloadAll bool) error {
+	s.startCalls.Add(1)
+	return nil
+}
+
+func (s *stuckHeaderStorage) RemoveBag(ctx context.Context, bag []byte, withFiles bool) error {
+	s.removeCalls.Add(1)
+	return nil
 }
 
 type fakeProvider struct {

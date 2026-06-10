@@ -102,8 +102,30 @@ const (
 	walletTxScanLimit        = 100
 )
 
+var (
+	bagHeaderWaitTimeout  = 60 * time.Second
+	bagHeaderPollInterval = 500 * time.Millisecond
+)
+
 type freshWalletAPI struct {
 	ton.APIClientWrapped
+}
+
+func logBagHeaderWaitTimeout(b string, waited time.Duration, detail *storage.BagDetailed) {
+	evt := log.Warn().
+		Str("bag", b).
+		Dur("waited", waited).
+		Dur("timeout", bagHeaderWaitTimeout)
+	if detail != nil {
+		evt = evt.
+			Str("detail_bag", detail.BagID).
+			Bool("info_loaded", detail.InfoLoaded).
+			Bool("header_loaded", detail.HeaderLoaded).
+			Bool("active", detail.Active).
+			Uint64("peers", detail.Bag.Peers).
+			Uint64("download_speed", detail.DownloadSpeed)
+	}
+	evt.Msg("bag header wait timed out, skipping for this loop")
 }
 
 type txConfirmationTimeoutError struct {
@@ -377,6 +399,16 @@ func doLoopWithDeps(deps loopDeps, idxUrl, providersUrl string, fromBlock uint32
 
 			log.Debug().Msgf("loading bag %s", b)
 
+			headerWaitStarted := time.Now()
+			isHeaderWaitTimedOut := func(detail *storage.BagDetailed) bool {
+				waited := time.Since(headerWaitStarted)
+				if waited < bagHeaderWaitTimeout {
+					return false
+				}
+				logBagHeaderWaitTimeout(b, waited, detail)
+				return true
+			}
+
 			for {
 				detail, err := deps.storage.GetBag(context.Background(), bag)
 				if err != nil {
@@ -384,20 +416,31 @@ func doLoopWithDeps(deps loopDeps, idxUrl, providersUrl string, fromBlock uint32
 						log.Info().Msgf("downloading header of %s", b)
 						if err = deps.storage.StartDownload(context.Background(), bag, false); err != nil {
 							log.Error().Err(err).Str("bag", b).Msg("failed to download header")
-							time.Sleep(500 * time.Millisecond)
+							if isHeaderWaitTimedOut(nil) {
+								return
+							}
+							time.Sleep(bagHeaderPollInterval)
 							continue
 						}
 					} else {
 						log.Error().Err(err).Str("bag", b).Msg("failed to get bag")
-						time.Sleep(500 * time.Millisecond)
+						if isHeaderWaitTimedOut(nil) {
+							return
+						}
+						time.Sleep(bagHeaderPollInterval)
 						continue
 					}
 				}
 
 				if detail == nil || !detail.HeaderLoaded {
-					log.Debug().Msgf("waiting bag %s", b)
+					waited := time.Since(headerWaitStarted)
+					if isHeaderWaitTimedOut(detail) {
+						return
+					}
 
-					time.Sleep(500 * time.Millisecond)
+					log.Debug().Dur("waited", waited).Msgf("waiting bag %s", b)
+
+					time.Sleep(bagHeaderPollInterval)
 					continue
 				}
 
