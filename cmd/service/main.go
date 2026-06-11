@@ -73,26 +73,51 @@ type NotifyProvider struct {
 	ToProof uint64
 }
 
-var contractBalanceStr = flag.String("contract-balance", "1", "Contract balance to maintain")
-var gasFeeAddStr = flag.String("gas-fee", "0.05", "Additional gas fee per tx")
-var maxSpanAllowed = flag.Int("max-span", 86400*14, "Maximum span allowed sec")
-var maxPerMBStr = flag.String("max-per-mb", "0.00015", "Maximum price per MB")
-var minRewardToVerifyStr = flag.String("max-reward-calc", "0.055", "Max reward after which we will calculate by per MB rate")
-var walletKeyBase = flag.String("wallet-key", "", "Wallet private key in Base64 (32 bytes)")
-var networkConfigUrl = flag.String("network-config-url", "https://ton.org/global.config.json", "TON Network configuration URL")
-var storageUrl = flag.String("storage-url", "http://127.0.0.1:8081", "Tonutils Storage server URL")
-var storageLogin = flag.String("storage-login", "1", "Tonutils Storage server login")
-var storagePassword = flag.String("storage-password", "1", "Tonutils Storage server password")
-var indexUrl = flag.String("index-url", "https://archival-dump.ton.org/index/mainnet.json", "Bags index URL")
-var limitBags = flag.Int("limit-bags", 10, "Limit for bags to process (0 = all)")
-var limitProviders = flag.Int("limit-providers", 100, "Limit for providers filter request (all fetched within single request)")
-var replicas = flag.Int("replicas", 3, "Providers per bag")
-var maxBagsPerProvider = flag.Int("max-bags-per-provider", 10, "Max bags per provider")
-var enableStats = flag.Bool("enable-stats", false, "Enable stats write to csv")
-var noTx = flag.Bool("no-tx", false, "Disable transactions")
-var noRemoveBag = flag.Bool("no-remove-bag", false, "Not remove bag after header save")
-var skipLiteserverHealthCheck = flag.Bool("skip-liteserver-health-check", false, "Skip startup lite server masterchain seqno health check")
-var maxLiteserverLag = flag.Uint("max-liteserver-lag", 512, "Max lite server masterchain seqno lag behind the best server during startup health check")
+const (
+	defaultConfigPath                = "config.json"
+	defaultContractBalance           = "1"
+	defaultGasFee                    = "0.05"
+	defaultMaxSpanAllowed            = 86400 * 14
+	defaultMaxPerMB                  = "0.00015"
+	defaultMinRewardToVerify         = "0.055"
+	defaultWalletKey                 = ""
+	defaultNetworkConfigURL          = "https://ton.org/global.config.json"
+	defaultStorageURL                = "http://127.0.0.1:8081"
+	defaultStorageLogin              = "1"
+	defaultStoragePassword           = "1"
+	defaultIndexURL                  = "https://archival-dump.ton.org/index/mainnet.json"
+	defaultLimitBags                 = 10
+	defaultLimitProviders            = 100
+	defaultReplicas                  = 3
+	defaultMaxBagsPerProvider        = 10
+	defaultEnableStats               = false
+	defaultNoTx                      = false
+	defaultNoRemoveBag               = false
+	defaultSkipLiteserverHealthCheck = false
+	defaultMaxLiteserverLag          = 512
+)
+
+var configPath = flag.String("config", defaultConfigPath, "Path to service configuration JSON file")
+var contractBalanceStr = flag.String("contract-balance", defaultContractBalance, "Contract balance to maintain")
+var gasFeeAddStr = flag.String("gas-fee", defaultGasFee, "Additional gas fee per tx")
+var maxSpanAllowed = flag.Int("max-span", defaultMaxSpanAllowed, "Maximum span allowed sec")
+var maxPerMBStr = flag.String("max-per-mb", defaultMaxPerMB, "Maximum price per MB")
+var minRewardToVerifyStr = flag.String("max-reward-calc", defaultMinRewardToVerify, "Max reward after which we will calculate by per MB rate")
+var walletKeyBase = flag.String("wallet-key", defaultWalletKey, "Wallet private key in Base64 (32 bytes)")
+var networkConfigUrl = flag.String("network-config-url", defaultNetworkConfigURL, "TON Network configuration URL")
+var storageUrl = flag.String("storage-url", defaultStorageURL, "Tonutils Storage server URL")
+var storageLogin = flag.String("storage-login", defaultStorageLogin, "Tonutils Storage server login")
+var storagePassword = flag.String("storage-password", defaultStoragePassword, "Tonutils Storage server password")
+var indexUrl = flag.String("index-url", defaultIndexURL, "Bags index URL")
+var limitBags = flag.Int("limit-bags", defaultLimitBags, "Limit for bags to process (0 = all)")
+var limitProviders = flag.Int("limit-providers", defaultLimitProviders, "Limit for providers filter request (all fetched within single request)")
+var replicas = flag.Int("replicas", defaultReplicas, "Providers per bag")
+var maxBagsPerProvider = flag.Int("max-bags-per-provider", defaultMaxBagsPerProvider, "Max bags per provider")
+var enableStats = flag.Bool("enable-stats", defaultEnableStats, "Enable stats write to csv")
+var noTx = flag.Bool("no-tx", defaultNoTx, "Disable transactions")
+var noRemoveBag = flag.Bool("no-remove-bag", defaultNoRemoveBag, "Not remove bag after header save")
+var skipLiteserverHealthCheck = flag.Bool("skip-liteserver-health-check", defaultSkipLiteserverHealthCheck, "Skip startup lite server masterchain seqno health check")
+var maxLiteserverLag = flag.Uint("max-liteserver-lag", defaultMaxLiteserverLag, "Max lite server masterchain seqno lag behind the best server during startup health check")
 
 var contractBalance, gasFeeAdd, maxPerMB, minRewardToVerify tlb.Coins
 
@@ -109,6 +134,264 @@ var (
 
 type freshWalletAPI struct {
 	ton.APIClientWrapped
+}
+
+type serviceConfig struct {
+	ContractBalance           string `json:"contract_balance"`
+	GasFee                    string `json:"gas_fee"`
+	MaxSpan                   int    `json:"max_span"`
+	MaxPerMB                  string `json:"max_per_mb"`
+	MaxRewardCalc             string `json:"max_reward_calc"`
+	WalletKey                 string `json:"wallet_key"`
+	NetworkConfigURL          string `json:"network_config_url"`
+	StorageURL                string `json:"storage_url"`
+	StorageLogin              string `json:"storage_login"`
+	StoragePassword           string `json:"storage_password"`
+	IndexURL                  string `json:"index_url"`
+	LimitBags                 int    `json:"limit_bags"`
+	LimitProviders            int    `json:"limit_providers"`
+	Replicas                  int    `json:"replicas"`
+	MaxBagsPerProvider        int    `json:"max_bags_per_provider"`
+	EnableStats               bool   `json:"enable_stats"`
+	NoTx                      bool   `json:"no_tx"`
+	NoRemoveBag               bool   `json:"no_remove_bag"`
+	SkipLiteserverHealthCheck bool   `json:"skip_liteserver_health_check"`
+	MaxLiteserverLag          uint   `json:"max_liteserver_lag"`
+}
+
+var legacyConfigJSONNames = map[string]string{
+	"contract-balance":             "contract_balance",
+	"gas-fee":                      "gas_fee",
+	"max-span":                     "max_span",
+	"max-per-mb":                   "max_per_mb",
+	"max-reward-calc":              "max_reward_calc",
+	"wallet-key":                   "wallet_key",
+	"network-config-url":           "network_config_url",
+	"storage-url":                  "storage_url",
+	"storage-login":                "storage_login",
+	"storage-password":             "storage_password",
+	"index-url":                    "index_url",
+	"limit-bags":                   "limit_bags",
+	"limit-providers":              "limit_providers",
+	"max-bags-per-provider":        "max_bags_per_provider",
+	"enable-stats":                 "enable_stats",
+	"no-tx":                        "no_tx",
+	"no-remove-bag":                "no_remove_bag",
+	"skip-liteserver-health-check": "skip_liteserver_health_check",
+	"max-liteserver-lag":           "max_liteserver_lag",
+}
+
+func defaultServiceConfig() serviceConfig {
+	return serviceConfig{
+		ContractBalance:           defaultContractBalance,
+		GasFee:                    defaultGasFee,
+		MaxSpan:                   defaultMaxSpanAllowed,
+		MaxPerMB:                  defaultMaxPerMB,
+		MaxRewardCalc:             defaultMinRewardToVerify,
+		WalletKey:                 defaultWalletKey,
+		NetworkConfigURL:          defaultNetworkConfigURL,
+		StorageURL:                defaultStorageURL,
+		StorageLogin:              defaultStorageLogin,
+		StoragePassword:           defaultStoragePassword,
+		IndexURL:                  defaultIndexURL,
+		LimitBags:                 defaultLimitBags,
+		LimitProviders:            defaultLimitProviders,
+		Replicas:                  defaultReplicas,
+		MaxBagsPerProvider:        defaultMaxBagsPerProvider,
+		EnableStats:               defaultEnableStats,
+		NoTx:                      defaultNoTx,
+		NoRemoveBag:               defaultNoRemoveBag,
+		SkipLiteserverHealthCheck: defaultSkipLiteserverHealthCheck,
+		MaxLiteserverLag:          defaultMaxLiteserverLag,
+	}
+}
+
+func currentServiceConfig() serviceConfig {
+	return serviceConfig{
+		ContractBalance:           *contractBalanceStr,
+		GasFee:                    *gasFeeAddStr,
+		MaxSpan:                   *maxSpanAllowed,
+		MaxPerMB:                  *maxPerMBStr,
+		MaxRewardCalc:             *minRewardToVerifyStr,
+		WalletKey:                 *walletKeyBase,
+		NetworkConfigURL:          *networkConfigUrl,
+		StorageURL:                *storageUrl,
+		StorageLogin:              *storageLogin,
+		StoragePassword:           *storagePassword,
+		IndexURL:                  *indexUrl,
+		LimitBags:                 *limitBags,
+		LimitProviders:            *limitProviders,
+		Replicas:                  *replicas,
+		MaxBagsPerProvider:        *maxBagsPerProvider,
+		EnableStats:               *enableStats,
+		NoTx:                      *noTx,
+		NoRemoveBag:               *noRemoveBag,
+		SkipLiteserverHealthCheck: *skipLiteserverHealthCheck,
+		MaxLiteserverLag:          *maxLiteserverLag,
+	}
+}
+
+func applyServiceConfig(cfg serviceConfig) {
+	*contractBalanceStr = cfg.ContractBalance
+	*gasFeeAddStr = cfg.GasFee
+	*maxSpanAllowed = cfg.MaxSpan
+	*maxPerMBStr = cfg.MaxPerMB
+	*minRewardToVerifyStr = cfg.MaxRewardCalc
+	*walletKeyBase = cfg.WalletKey
+	*networkConfigUrl = cfg.NetworkConfigURL
+	*storageUrl = cfg.StorageURL
+	*storageLogin = cfg.StorageLogin
+	*storagePassword = cfg.StoragePassword
+	*indexUrl = cfg.IndexURL
+	*limitBags = cfg.LimitBags
+	*limitProviders = cfg.LimitProviders
+	*replicas = cfg.Replicas
+	*maxBagsPerProvider = cfg.MaxBagsPerProvider
+	*enableStats = cfg.EnableStats
+	*noTx = cfg.NoTx
+	*noRemoveBag = cfg.NoRemoveBag
+	*skipLiteserverHealthCheck = cfg.SkipLiteserverHealthCheck
+	*maxLiteserverLag = cfg.MaxLiteserverLag
+}
+
+func explicitFlags(fs *flag.FlagSet) map[string]bool {
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) {
+		set[f.Name] = true
+	})
+	return set
+}
+
+func loadAndApplyServiceConfig(path string, explicit map[string]bool) error {
+	if path == "" {
+		return fmt.Errorf("config path is required")
+	}
+
+	cfg := defaultServiceConfig()
+	created := false
+	data, err := os.ReadFile(path)
+	if err == nil {
+		if len(bytes.TrimSpace(data)) > 0 {
+			if err := decodeServiceConfig(data, &cfg); err != nil {
+				return fmt.Errorf("failed to decode config %s: %w", path, err)
+			}
+		}
+	} else if os.IsNotExist(err) {
+		created = true
+	} else {
+		return fmt.Errorf("failed to read config %s: %w", path, err)
+	}
+
+	applyFlagOverrides(&cfg, explicit)
+	if created {
+		if err := writeServiceConfig(path, cfg); err != nil {
+			return err
+		}
+	}
+	applyServiceConfig(cfg)
+	return nil
+}
+
+func decodeServiceConfig(data []byte, cfg *serviceConfig) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if raw == nil {
+		return nil
+	}
+	for legacyName, name := range legacyConfigJSONNames {
+		value, ok := raw[legacyName]
+		if !ok {
+			continue
+		}
+		if _, exists := raw[name]; !exists {
+			raw[name] = value
+		}
+	}
+
+	normalized, err := json.Marshal(raw)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(normalized, cfg)
+}
+
+func applyFlagOverrides(cfg *serviceConfig, explicit map[string]bool) {
+	flagCfg := currentServiceConfig()
+
+	if explicit["contract-balance"] {
+		cfg.ContractBalance = flagCfg.ContractBalance
+	}
+	if explicit["gas-fee"] {
+		cfg.GasFee = flagCfg.GasFee
+	}
+	if explicit["max-span"] {
+		cfg.MaxSpan = flagCfg.MaxSpan
+	}
+	if explicit["max-per-mb"] {
+		cfg.MaxPerMB = flagCfg.MaxPerMB
+	}
+	if explicit["max-reward-calc"] {
+		cfg.MaxRewardCalc = flagCfg.MaxRewardCalc
+	}
+	if explicit["wallet-key"] {
+		cfg.WalletKey = flagCfg.WalletKey
+	}
+	if explicit["network-config-url"] {
+		cfg.NetworkConfigURL = flagCfg.NetworkConfigURL
+	}
+	if explicit["storage-url"] {
+		cfg.StorageURL = flagCfg.StorageURL
+	}
+	if explicit["storage-login"] {
+		cfg.StorageLogin = flagCfg.StorageLogin
+	}
+	if explicit["storage-password"] {
+		cfg.StoragePassword = flagCfg.StoragePassword
+	}
+	if explicit["index-url"] {
+		cfg.IndexURL = flagCfg.IndexURL
+	}
+	if explicit["limit-bags"] {
+		cfg.LimitBags = flagCfg.LimitBags
+	}
+	if explicit["limit-providers"] {
+		cfg.LimitProviders = flagCfg.LimitProviders
+	}
+	if explicit["replicas"] {
+		cfg.Replicas = flagCfg.Replicas
+	}
+	if explicit["max-bags-per-provider"] {
+		cfg.MaxBagsPerProvider = flagCfg.MaxBagsPerProvider
+	}
+	if explicit["enable-stats"] {
+		cfg.EnableStats = flagCfg.EnableStats
+	}
+	if explicit["no-tx"] {
+		cfg.NoTx = flagCfg.NoTx
+	}
+	if explicit["no-remove-bag"] {
+		cfg.NoRemoveBag = flagCfg.NoRemoveBag
+	}
+	if explicit["skip-liteserver-health-check"] {
+		cfg.SkipLiteserverHealthCheck = flagCfg.SkipLiteserverHealthCheck
+	}
+	if explicit["max-liteserver-lag"] {
+		cfg.MaxLiteserverLag = flagCfg.MaxLiteserverLag
+	}
+}
+
+func writeServiceConfig(path string, cfg serviceConfig) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to encode config %s: %w", path, err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("failed to write config %s: %w", path, err)
+	}
+	return nil
 }
 
 func logBagHeaderWaitTimeout(b string, waited time.Duration, detail *storage.BagDetailed) {
@@ -176,6 +459,10 @@ func (api freshWalletAPI) CurrentMasterchainInfo(ctx context.Context) (*ton.Bloc
 
 func main() {
 	flag.Parse()
+	if err := loadAndApplyServiceConfig(*configPath, explicitFlags(flag.CommandLine)); err != nil {
+		log.Fatal().Err(err).Msg("failed to load config")
+		return
+	}
 
 	contractBalance = tlb.MustFromTON(*contractBalanceStr)
 	gasFeeAdd = tlb.MustFromTON(*gasFeeAddStr)

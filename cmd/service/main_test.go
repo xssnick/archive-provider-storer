@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -252,6 +253,155 @@ func TestDoLoopSkipsBagWhenHeaderWaitTimesOut(t *testing.T) {
 	}
 	if len(details) != 0 {
 		t.Fatalf("timed out bag was cached despite missing header: got %d details", len(details))
+	}
+}
+
+func TestLoadAndApplyServiceConfigCreatesFileWithFlagOverrides(t *testing.T) {
+	oldCfg := currentServiceConfig()
+	t.Cleanup(func() {
+		applyServiceConfig(oldCfg)
+	})
+	applyServiceConfig(defaultServiceConfig())
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	*walletKeyBase = "flag-wallet"
+	*storageUrl = "http://flag-storage"
+	*limitBags = 0
+	*enableStats = true
+
+	err := loadAndApplyServiceConfig(path, map[string]bool{
+		"wallet-key":   true,
+		"storage-url":  true,
+		"limit-bags":   true,
+		"enable-stats": true,
+	})
+	if err != nil {
+		t.Fatalf("loadAndApplyServiceConfig returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"wallet_key", "storage_url", "limit_bags", "enable_stats", "gas_fee"} {
+		if _, ok := raw[name]; !ok {
+			t.Fatalf("created config is missing %q", name)
+		}
+	}
+	for _, name := range []string{"wallet-key", "storage-url", "limit-bags", "enable-stats", "gas-fee"} {
+		if _, ok := raw[name]; ok {
+			t.Fatalf("created config has legacy dash key %q", name)
+		}
+	}
+
+	var cfg serviceConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.WalletKey != "flag-wallet" {
+		t.Fatalf("wallet key mismatch: got %q", cfg.WalletKey)
+	}
+	if cfg.StorageURL != "http://flag-storage" {
+		t.Fatalf("storage url mismatch: got %q", cfg.StorageURL)
+	}
+	if cfg.LimitBags != 0 {
+		t.Fatalf("limit bags mismatch: got %d, want 0", cfg.LimitBags)
+	}
+	if !cfg.EnableStats {
+		t.Fatal("enable stats flag override was not saved")
+	}
+	if cfg.GasFee != defaultGasFee {
+		t.Fatalf("gas fee default mismatch: got %q, want %q", cfg.GasFee, defaultGasFee)
+	}
+
+	if *walletKeyBase != "flag-wallet" || *storageUrl != "http://flag-storage" || *limitBags != 0 || !*enableStats {
+		t.Fatal("created config values were not applied to flags")
+	}
+}
+
+func TestLoadAndApplyServiceConfigUsesConfigAndFlagOverrides(t *testing.T) {
+	oldCfg := currentServiceConfig()
+	t.Cleanup(func() {
+		applyServiceConfig(oldCfg)
+	})
+	applyServiceConfig(defaultServiceConfig())
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := defaultServiceConfig()
+	cfg.WalletKey = "config-wallet"
+	cfg.StorageURL = "http://config-storage"
+	cfg.LimitProviders = 7
+	cfg.EnableStats = true
+	cfg.NoTx = true
+	if err := writeServiceConfig(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	*storageUrl = "http://flag-storage"
+	*enableStats = false
+	err := loadAndApplyServiceConfig(path, map[string]bool{
+		"storage-url":  true,
+		"enable-stats": true,
+	})
+	if err != nil {
+		t.Fatalf("loadAndApplyServiceConfig returned error: %v", err)
+	}
+
+	if *walletKeyBase != "config-wallet" {
+		t.Fatalf("wallet key mismatch: got %q", *walletKeyBase)
+	}
+	if *storageUrl != "http://flag-storage" {
+		t.Fatalf("storage url flag override mismatch: got %q", *storageUrl)
+	}
+	if *limitProviders != 7 {
+		t.Fatalf("limit providers mismatch: got %d, want 7", *limitProviders)
+	}
+	if *enableStats {
+		t.Fatal("explicit false bool flag did not override config")
+	}
+	if !*noTx {
+		t.Fatal("config bool value was not applied")
+	}
+}
+
+func TestLoadAndApplyServiceConfigAcceptsLegacyDashKeys(t *testing.T) {
+	oldCfg := currentServiceConfig()
+	t.Cleanup(func() {
+		applyServiceConfig(oldCfg)
+	})
+	applyServiceConfig(defaultServiceConfig())
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	data := []byte(`{
+  "wallet-key": "legacy-wallet",
+  "storage-url": "http://legacy-storage",
+  "limit-providers": 9,
+  "no-tx": true
+}`)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := loadAndApplyServiceConfig(path, nil); err != nil {
+		t.Fatalf("loadAndApplyServiceConfig returned error: %v", err)
+	}
+
+	if *walletKeyBase != "legacy-wallet" {
+		t.Fatalf("wallet key mismatch: got %q", *walletKeyBase)
+	}
+	if *storageUrl != "http://legacy-storage" {
+		t.Fatalf("storage url mismatch: got %q", *storageUrl)
+	}
+	if *limitProviders != 9 {
+		t.Fatalf("limit providers mismatch: got %d, want 9", *limitProviders)
+	}
+	if !*noTx {
+		t.Fatal("legacy bool value was not applied")
 	}
 }
 
